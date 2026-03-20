@@ -237,12 +237,10 @@ def solve_group(group: dict) -> SolveResult | None:
     # 3a. Range check — position must be within MAX_RANGE of all sensors
     for s in sensor_positions:
         if np.linalg.norm(position - s) > MAX_RANGE_M:
-            print("Failed range check")
             return None
 
     # 3b. Residual check
     if residual_m > MAX_RESIDUAL_M:
-        print("Failed residual check")
         return None
 
     # 3c. GDOP computation (Part 4.3)

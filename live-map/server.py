@@ -36,19 +36,22 @@ import random
 import sys
 import threading
 import time
-    yield
-    task.cancel()
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 # Add parent directory to sys.path to access mlat-solver modules
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
 from gdop import compute_gdop
 from geo import lla_to_ecef
-import numpy as np
 
 # Cache for GDOP grid
 _gdop_grid_cache = None
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 # Server configuration
 HOST = os.environ.get("MLAT_MAP_HOST", "0.0.0.0")
