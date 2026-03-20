@@ -60,8 +60,10 @@ import os
 import sys
 import time
 
-# Ensure imports work regardless of CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from geo import lla_to_ecef
+C_VACUUM = 299792458.0
 
 from solver import solve_group
 
@@ -82,11 +84,20 @@ class Stats:
         self.method_counts: dict[str, int] = {}
         # Residual tracking
         self.residuals: list[float] = []
+        # Clock sync validation (rolling 100 samples per sensor)
+        self.sensor_residuals_m: dict[int, list[float]] = {}
 
     def record_solve(self, method: str, residual_m: float) -> None:
         self.groups_solved += 1
         self.method_counts[method] = self.method_counts.get(method, 0) + 1
         self.residuals.append(residual_m)
+
+    def record_sensor_residual(self, sensor_id: int, residual_m: float) -> None:
+        if sensor_id not in self.sensor_residuals_m:
+            self.sensor_residuals_m[sensor_id] = []
+        self.sensor_residuals_m[sensor_id].append(residual_m)
+        if len(self.sensor_residuals_m[sensor_id]) > 100:
+            self.sensor_residuals_m[sensor_id].pop(0)
 
     def to_dict(self) -> dict:
         result: dict = {
@@ -109,6 +120,13 @@ class Stats:
             result["p95_residual_m"] = round(
                 sorted_r[int(n * 0.95)] if n > 20 else sorted_r[-1], 2
             )
+        if self.sensor_residuals_m:
+            # Report the mean residual bias per sensor as a clock sync indicator
+            result["clock_sync_bias_m"] = {
+                str(sid): round(sum(res) / len(res), 2)
+                for sid, res in self.sensor_residuals_m.items()
+                if len(res) >= 10
+            }
         return result
 
 
@@ -150,7 +168,15 @@ def main() -> None:
                 stats.groups_skipped_sensors += 1
                 continue
 
-            # Solve the correlation group
+            # Pass 2-sensor groups downstream for track-builder prediction-aided solve
+            if n_sensors == 2 and group.get("altitude_ft") is not None:
+                # We need altitude to constrain the 2-sensor system
+                output = {"unsolved_group": group}
+                print(json.dumps(output, separators=(",", ":")), flush=True)
+                stats.groups_skipped_sensors += 1
+                continue
+
+            # Solve the correlation group (>= 3 sensors)
             result = solve_group(group)
 
             if result is not None:
@@ -158,6 +184,25 @@ def main() -> None:
                 output = result.to_dict()
                 print(json.dumps(output, separators=(",", ":")), flush=True)
                 stats.record_solve(result.solve_method, result.residual_m)
+
+                # Back-compute individual sensor residuals for Clock Sync validation
+                aircraft_ecef = lla_to_ecef(result.lat, result.lon, result.alt_ft * 0.3048)
+                for rec in group.get("receptions", []):
+                    s_id = rec.get("sensor_id")
+                    if s_id is not None:
+                        s_pos = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
+                        dt_s = rec["timestamp_s"] - result.timestamp_s
+                        dt_ns = rec["timestamp_ns"] - result.timestamp_ns
+                        arr_time = dt_s + dt_ns * 1e-9
+                        
+                        dist = ((aircraft_ecef[0] - s_pos[0])**2 + 
+                                (aircraft_ecef[1] - s_pos[1])**2 + 
+                                (aircraft_ecef[2] - s_pos[2])**2)**0.5
+                                
+                        expected_arr = dist / C_VACUUM
+                        actual_arr = arr_time - result.t0_s
+                        residual_m = (actual_arr - expected_arr) * C_VACUUM
+                        stats.record_sensor_residual(s_id, residual_m)
             else:
                 stats.groups_failed += 1
 

@@ -194,6 +194,7 @@
     // ── State ──────────────────────────────────────────────────────
     let aircraftData = [];
     let trailData = [];
+    let gdopGrid = [];
     let updateCount = 0;
     let ws = null;
     let reconnectTimer = null;
@@ -255,9 +256,65 @@
         });
         map.addControl(deckOverlay);
     }
+    function computeEllipseVertices(center, covMatrix, segments=32) {
+        if (!covMatrix) return [];
+        const [lon, lat] = center;
+        const Pxx = covMatrix[0][0];
+        const Pxy = covMatrix[0][1];
+        const Pyy = covMatrix[1][1];
+
+        const trace = Pxx + Pyy;
+        const det = Pxx * Pyy - Pxy * Pxy;
+        const lambda1 = (trace + Math.sqrt(Math.max(0, trace * trace - 4 * det))) / 2;
+        const lambda2 = (trace - Math.sqrt(Math.max(0, trace * trace - 4 * det))) / 2;
+
+        const theta = 0.5 * Math.atan2(2 * Pxy, Pxx - Pyy);
+        const scale1 = 3.03 * Math.sqrt(Math.max(0, lambda1));
+        const scale2 = 3.03 * Math.sqrt(Math.max(0, lambda2));
+
+        const metersPerDegLat = 111320;
+        const metersPerDegLon = 40075000 * Math.cos(lat * Math.PI / 180) / 360;
+
+        const vertices = [];
+        for (let i = 0; i < segments; i++) {
+            const angle = (i * 2 * Math.PI) / segments;
+            const x = scale1 * Math.cos(angle);
+            const y = scale2 * Math.sin(angle);
+
+            const dx = x * Math.cos(theta) - y * Math.sin(theta);
+            const dy = x * Math.sin(theta) + y * Math.cos(theta);
+
+            vertices.push([
+                lon + dx / metersPerDegLon,
+                lat + dy / metersPerDegLat
+            ]);
+        }
+        return vertices;
+    }
 
     function buildLayers() {
         const layers = [];
+
+        // GDOP sweet-spot heatmap layer
+        if (gdopGrid && gdopGrid.length > 0) {
+            layers.push(new deck.HeatmapLayer({
+                id: 'gdop-heatmap',
+                data: gdopGrid,
+                getPosition: d => [d.lon, d.lat],
+                getWeight: d => Math.max(0.1, 10.0 / Math.max(d.gdop, 1.0)),
+                radiusPixels: 45,
+                intensity: 1.5,
+                threshold: 0.1,
+                colorRange: [
+                    [0, 0, 0, 0],
+                    [0, 100, 255, 40],
+                    [0, 200, 255, 60],
+                    [0, 255, 100, 80],
+                    [255, 255, 0, 100],
+                    [255, 100, 0, 120]
+                ]
+            }));
+        }
 
         // Trail layer — PathLayer for flight trails
         if (trailData.length > 0) {
@@ -278,8 +335,20 @@
             }));
         }
 
-        // Aircraft icon layer — ScatterplotLayer for aircraft positions
+        // Aircraft icon layer and uncertainty ellipses
         if (aircraftData.length > 0) {
+            layers.push(new deck.PolygonLayer({
+                id: 'uncertainty-ellipses',
+                data: aircraftData.filter(d => d.cov_matrix && d.cov_matrix[0][0] < 1e5),
+                getPolygon: d => computeEllipseVertices([d.lon, d.lat], d.cov_matrix),
+                getFillColor: [255, 60, 60, 40],
+                getLineColor: [255, 60, 60, 150],
+                lineWidthMinPixels: 1,
+                stroked: true,
+                filled: true,
+                pickable: false,
+            }));
+
             layers.push(new deck.ScatterplotLayer({
                 id: 'aircraft',
                 data: aircraftData,
@@ -454,6 +523,7 @@
             gdop: ac.gdop,
             residual_m: ac.residual_m,
             solve_method: ac.solve_method,
+            cov_matrix: ac.cov_matrix,
         }));
 
         // Update trail data
@@ -481,7 +551,15 @@
     }
 
     // ── Initialize ─────────────────────────────────────────────────
-    map.on('load', () => {
+    map.on('load', async () => {
+        try {
+            const resp = await fetch('/api/gdop_grid');
+            const data = await resp.json();
+            gdopGrid = data.grid || [];
+        } catch(e) {
+            console.error('Failed to load GDOP grid', e);
+        }
+
         createDeckOverlay();
         connectWebSocket();
     });

@@ -37,6 +37,7 @@ def frisch_residual(
     arrival_times: np.ndarray,
     sensor_alts_m: np.ndarray,
     aircraft_alt_m: float | None,
+    track_prediction_ecef: np.ndarray | None = None,
     c: float = C_VACUUM,
 ) -> np.ndarray:
     """Compute TOA residuals with analytical t0 elimination.
@@ -84,6 +85,13 @@ def frisch_residual(
         alt_residual = (current_alt - aircraft_alt_m) * 10.0
         residuals = np.append(residuals, alt_residual)
 
+    # Optional: prediction anchor for underdetermined 2-sensor fallback
+    if track_prediction_ecef is not None:
+        # Soft constraint forcing the solver to pick the intersection point
+        # closest to the EKF prediction. Weight = 0.5 balances geometry vs prediction.
+        pred_residual = np.linalg.norm(x - track_prediction_ecef) * 0.5
+        residuals = np.append(residuals, pred_residual)
+
     return residuals
 
 
@@ -93,6 +101,7 @@ def solve_toa(
     sensor_alts_m: np.ndarray,
     x0: np.ndarray,
     altitude_m: float | None = None,
+    track_prediction_ecef: np.ndarray | None = None,
     c: float = C_VACUUM,
     max_nfev: int = 50,
 ) -> dict | None:
@@ -120,7 +129,7 @@ def solve_toa(
         result = least_squares(
             frisch_residual,
             x0,
-            args=(sensors, arrival_times, sensor_alts_m, altitude_m, c),
+            args=(sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c),
             method="trf",
             loss="soft_l1",
             f_scale=1000.0,  # Looser outlier transition so far initialization doesn't plateau
@@ -144,7 +153,7 @@ def solve_toa(
 
         # Compute final residual (RMS of residuals in meters)
         final_residuals = frisch_residual(
-            position, sensors, arrival_times, sensor_alts_m, altitude_m, c
+            position, sensors, arrival_times, sensor_alts_m, altitude_m, track_prediction_ecef, c
         )
         residual_m = float(np.sqrt(np.mean(final_residuals ** 2)))
 

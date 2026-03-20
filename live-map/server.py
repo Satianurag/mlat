@@ -19,9 +19,6 @@ Usage:
     Or replay from saved Layer 5 output:
     cat track_data.jsonl | python3 live-map/server.py
 
-    Or run standalone for demo/testing:
-    python3 live-map/server.py --demo
-
 References:
   - MLAT_Verified_Combined_Reference.md Part 3.3 (Layer 6 spec)
   - MLAT_Verified_Combined_Reference.md Part 5.2 (Stack: FastAPI + MapLibre + Deck.gl)
@@ -39,11 +36,17 @@ import random
 import sys
 import threading
 import time
-from pathlib import Path
+    yield
+    task.cancel()
 
-import uvicorn
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+# Add parent directory to sys.path to access mlat-solver modules
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlat-solver"))
+from gdop import compute_gdop
+from geo import lla_to_ecef
+import numpy as np
+
+# Cache for GDOP grid
+_gdop_grid_cache = None
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -197,6 +200,52 @@ async def get_aircraft() -> dict:
     return store.get_snapshot()
 
 
+@app.get("/api/gdop_grid")
+async def get_gdop_grid() -> dict:
+    """Return an evaluated GDOP grid overlay for Cornwall."""
+    global _gdop_grid_cache
+    if _gdop_grid_cache is not None:
+        return _gdop_grid_cache
+        
+    sensor_ecef = np.array([
+        lla_to_ecef(s["lat"], s["lon"], 100.0) 
+        for s in [
+            {"lon": -5.7, "lat": 50.1},
+            {"lon": -5.6, "lat": 50.2},
+            {"lon": -5.5, "lat": 50.3},
+            {"lon": -5.4, "lat": 50.15},
+            {"lon": -5.3, "lat": 50.25},
+            {"lon": -5.1, "lat": 50.35},
+            {"lon": -5.0, "lat": 50.1},
+            {"lon": -6.3, "lat": 49.92},
+            {"lon": -6.35, "lat": 49.95},
+        ]
+    ])
+    
+    grid = []
+    # 20x20 grid over Cornwall bounds
+    lat_min, lat_max = 49.8, 50.8
+    lon_min, lon_max = -6.5, -4.5
+    steps = 20
+    
+    alt_m = 30000 * 0.3048  # evaluate GDOP at 30k feet
+    
+    for i in range(steps):
+        lat = lat_min + (lat_max - lat_min) * i / (steps - 1)
+        for j in range(steps):
+            lon = lon_min + (lon_max - lon_min) * j / (steps - 1)
+            pos_ecef = lla_to_ecef(lat, lon, alt_m)
+            gdop = compute_gdop(pos_ecef, sensor_ecef)
+            grid.append({
+                "lat": round(lat, 4),
+                "lon": round(lon, 4),
+                "gdop": round(float(gdop), 2)
+            })
+            
+    _gdop_grid_cache = {"grid": grid}
+    return _gdop_grid_cache
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """WebSocket endpoint for real-time aircraft updates.
@@ -246,80 +295,6 @@ def stdin_reader() -> None:
     log("Stdin reader finished")
 
 
-# ── Demo mode ─────────────────────────────────────────────────────────
-
-def demo_data_generator() -> None:
-    """Generate synthetic aircraft data for demo/testing.
-
-    Simulates multiple aircraft flying over the Cornwall sensor area
-    with realistic headings and speeds.
-    """
-    log("Demo mode: generating synthetic aircraft over Cornwall")
-
-    # Simulated aircraft with initial positions near Cornwall
-    aircraft = [
-        {"icao": "4CA7E8", "lat": 50.15, "lon": -5.50, "alt_ft": 36000,
-         "heading": 45, "speed_kts": 450},
-        {"icao": "4CA100", "lat": 50.30, "lon": -5.20, "alt_ft": 28000,
-         "heading": 180, "speed_kts": 380},
-        {"icao": "4CA201", "lat": 49.90, "lon": -5.80, "alt_ft": 41000,
-         "heading": 90, "speed_kts": 500},
-        {"icao": "4CA302", "lat": 50.40, "lon": -5.00, "alt_ft": 32000,
-         "heading": 270, "speed_kts": 420},
-        {"icao": "4CA403", "lat": 50.05, "lon": -5.35, "alt_ft": 25000,
-         "heading": 135, "speed_kts": 350},
-    ]
-
-    timestamp_s = 43200  # Start at noon
-
-    while True:
-        for ac in aircraft:
-            # Update position based on heading and speed
-            speed_deg_per_s = ac["speed_kts"] / 3600.0 / 60.0  # rough deg/s
-            heading_rad = math.radians(ac["heading"])
-            ac["lat"] += speed_deg_per_s * math.cos(heading_rad)
-            ac["lon"] += speed_deg_per_s * math.sin(heading_rad)
-
-            # Add small random variations
-            ac["heading"] += random.uniform(-2, 2)
-            ac["alt_ft"] += random.uniform(-100, 100)
-
-            # Wrap around if too far from Cornwall
-            if abs(ac["lat"] - 50.15) > 2.0 or abs(ac["lon"] + 5.5) > 3.0:
-                ac["lat"] = 50.15 + random.uniform(-0.5, 0.5)
-                ac["lon"] = -5.50 + random.uniform(-0.5, 0.5)
-
-            track = {
-                "icao": ac["icao"],
-                "lat": round(ac["lat"], 6),
-                "lon": round(ac["lon"], 6),
-                "alt_ft": round(ac["alt_ft"], 0),
-                "heading_deg": round(ac["heading"] % 360, 1),
-                "speed_kts": round(ac["speed_kts"] + random.uniform(-10, 10), 1),
-                "vrate_fpm": round(random.uniform(-500, 500), 0),
-                "track_quality": random.randint(3, 15),
-                "positions_count": random.randint(5, 50),
-                "residual_m": round(random.uniform(50, 300), 2),
-                "gdop": round(random.uniform(2, 8), 2),
-                "num_sensors": random.randint(3, 7),
-                "solve_method": random.choice([
-                    "inamdar_5sensor", "inamdar_4sensor_alt",
-                    "constrained_3sensor", "frisch_toa",
-                ]),
-                "timestamp_s": timestamp_s,
-                "timestamp_ns": random.randint(0, 999999999),
-                "df_type": 4,
-                "squawk": None,
-                "raw_msg": "DEMO",
-                "t0_s": float(timestamp_s),
-                "_update_time": time.time(),
-            }
-            store.update(track)
-
-        timestamp_s += 1
-        time.sleep(1.0)
-
-
 # ── Logging ───────────────────────────────────────────────────────────
 
 def log(msg: str) -> None:
@@ -331,10 +306,6 @@ def log(msg: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MLAT Live Map Server (Layer 6)")
-    parser.add_argument(
-        "--demo", action="store_true",
-        help="Run with synthetic demo data (no stdin required)",
-    )
     parser.add_argument(
         "--host", default=HOST,
         help=f"Server host (default: {HOST})",
@@ -351,15 +322,9 @@ def main() -> None:
     log(f"Update interval: {UPDATE_INTERVAL_S}s")
     log(f"Server: http://{args.host}:{args.port}")
 
-    if args.demo:
-        # Start demo data generator in background thread
-        demo_thread = threading.Thread(target=demo_data_generator, daemon=True)
-        demo_thread.start()
-        log("Demo data generator started")
-    else:
-        # Start stdin reader in background thread
-        reader_thread = threading.Thread(target=stdin_reader, daemon=True)
-        reader_thread.start()
+    # Start stdin reader in background thread
+    reader_thread = threading.Thread(target=stdin_reader, daemon=True)
+    reader_thread.start()
 
     # Start FastAPI server
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

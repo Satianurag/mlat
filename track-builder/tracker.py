@@ -220,6 +220,20 @@ class TrackState:
         pos = self.ekf.position
         lat, lon, _ = ecef_to_lla(pos[0], pos[1], pos[2])
 
+        # Convert ECEF covariance to local ENU for 2D ellipse visualization
+        lat_r = math.radians(lat)
+        lon_r = math.radians(lon)
+        sin_lat = math.sin(lat_r)
+        cos_lat = math.cos(lat_r)
+        sin_lon = math.sin(lon_r)
+        cos_lon = math.cos(lon_r)
+        R_enu = np.array([
+            [-sin_lon, cos_lon, 0],
+            [-sin_lat*cos_lon, -sin_lat*sin_lon, cos_lat],
+            [cos_lat*cos_lon, cos_lat*sin_lon, sin_lat]
+        ])
+        P_enu = R_enu @ self.ekf.P[:3, :3] @ R_enu.T
+
         return {
             "icao": self.icao,
             "lat": round(lat, 6),
@@ -240,6 +254,10 @@ class TrackState:
             "squawk": self.last_squawk,
             "raw_msg": fix.get("raw_msg", ""),
             "t0_s": fix.get("t0_s", 0.0),
+            "cov_matrix": [
+                [float(P_enu[0, 0]), float(P_enu[0, 1])],
+                [float(P_enu[1, 0]), float(P_enu[1, 1])]
+            ],
         }
 
 
@@ -275,6 +293,9 @@ class TrackManager:
             Enriched track output dict, or None if rejected.
         """
         self.fixes_received += 1
+
+        if "unsolved_group" in fix:
+            return self._solve_prediction_aided(fix["unsolved_group"])
 
         icao = fix.get("icao", "")
         if not icao:
@@ -335,6 +356,83 @@ class TrackManager:
 
         self.fixes_accepted += 1
         return track.to_output_dict(fix)
+
+    def _solve_prediction_aided(self, group: dict) -> dict | None:
+        """Attempt to solve a 2-sensor group using EKF track prediction."""
+        icao = group.get("icao", "")
+        if not icao:
+            return None
+
+        track = self._tracks.get(icao)
+        if track is None or not track.is_established:
+            return None  # Cannot predict-aid without an established track
+
+        receptions = group.get("receptions", [])
+        if len(receptions) != 2:
+            return None
+
+        altitude_ft = group.get("altitude_ft")
+        if altitude_ft is None:
+            return None
+        altitude_m = float(altitude_ft) * 0.3048
+
+        # Extract sensor positions and arrival times
+        sensor_positions = np.zeros((2, 3))
+        sensor_alts_m = np.zeros(2)
+        arrival_times = np.zeros(2)
+
+        ref_idx = min(range(2), key=lambda i: receptions[i]["timestamp_s"] * 1000000000 + receptions[i]["timestamp_ns"])
+        ref_timestamp_s = receptions[ref_idx]["timestamp_s"]
+        ref_timestamp_ns = receptions[ref_idx]["timestamp_ns"]
+
+        for i, rec in enumerate(receptions):
+            sensor_positions[i] = lla_to_ecef(rec["lat"], rec["lon"], rec["alt"])
+            sensor_alts_m[i] = rec["alt"]
+            dt_s = rec["timestamp_s"] - ref_timestamp_s
+            dt_ns = rec["timestamp_ns"] - ref_timestamp_ns
+            arrival_times[i] = dt_s + dt_ns * 1e-9
+
+        # Predict track position for the new timestamp
+        target_ts = float(ref_timestamp_s) + float(ref_timestamp_ns) * 1e-9
+        predicted_ecef = track.ekf.predict(target_ts)
+
+        from frisch import solve_toa
+        result = solve_toa(
+            sensors=sensor_positions,
+            arrival_times=arrival_times,
+            sensor_alts_m=sensor_alts_m,
+            x0=predicted_ecef,
+            altitude_m=altitude_m,
+            track_prediction_ecef=predicted_ecef,
+        )
+
+        if result is None:
+            return None
+
+        # Format the result like a normal solved fix from Layer 4
+        position = result["position"]
+        lat, lon, _ = ecef_to_lla(position[0], position[1], position[2])
+
+        solved_fix = {
+            "icao": icao,
+            "lat": lat,
+            "lon": lon,
+            "alt_ft": altitude_ft,
+            "residual_m": result["residual_m"],
+            "gdop": 0.0,
+            "num_sensors": 2,
+            "solve_method": "prediction_aided_2sensor",
+            "timestamp_s": ref_timestamp_s,
+            "timestamp_ns": ref_timestamp_ns,
+            "df_type": group.get("df_type", 0),
+            "squawk": group.get("squawk"),
+            "raw_msg": group.get("raw_msg", ""),
+            "t0_s": result["t0_s"],
+        }
+        
+        # Don't double count fixes received, but do process the solved fix
+        self.fixes_received -= 1
+        return self.process_fix(solved_fix)
 
     def prune_stale(self) -> int:
         """Remove tracks that have not received updates recently.
