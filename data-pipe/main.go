@@ -25,7 +25,7 @@ import (
 
 var Version = "0.1.0"
 
-const ADSBProtocol = protocol.ID("/adsb/v1")
+const ADSBProtocol = protocol.ID("neuron/ADSB/0.0.2")
 
 // ModeSPacket represents a single parsed Mode-S reception from a sensor
 type ModeSPacket struct {

@@ -3,8 +3,13 @@ module github.com/Satianurag/mlat/data-pipe
 go 1.23.2
 
 require (
+	github.com/NeuronInnovations/neuron-go-hedera-sdk v0.0.21
+	github.com/hashgraph/hedera-sdk-go/v2 v2.46.0
+	github.com/libp2p/go-libp2p v0.38.2
+)
+
+require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/NeuronInnovations/neuron-go-hedera-sdk v0.0.21 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -40,7 +45,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashgraph/hedera-protobufs-go v0.2.1-0.20240910141930-3e9d10484c9a // indirect
-	github.com/hashgraph/hedera-sdk-go/v2 v2.46.0 // indirect
 	github.com/holiman/uint256 v1.3.1 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/ipfs/go-cid v0.4.1 // indirect
@@ -54,7 +58,6 @@ require (
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.2.0 // indirect
-	github.com/libp2p/go-libp2p v0.38.2 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
 	github.com/libp2p/go-msgio v0.3.0 // indirect
 	github.com/libp2p/go-nat v0.2.0 // indirect

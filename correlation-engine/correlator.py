@@ -160,11 +160,11 @@ class Correlator:
 
         reception = Reception(
             sensor_id=sensor_id,
-            lat=packet.get("lat", 0.0),
-            lon=packet.get("lon", 0.0),
-            alt=packet.get("alt", 0.0),
-            timestamp_s=packet.get("timestamp_s", 0),
-            timestamp_ns=packet.get("timestamp_ns", 0),
+            lat=packet.get("lat") or 0.0,
+            lon=packet.get("lon") or 0.0,
+            alt=packet.get("alt") or 0.0,
+            timestamp_s=packet.get("timestamp_s") or 0,
+            timestamp_ns=packet.get("timestamp_ns") or 0,
         )
 
         current_time_ns = reception.abs_time_ns

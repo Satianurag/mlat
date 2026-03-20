@@ -35,3 +35,9 @@ Thumbs.db
 
 # WireGuard
 wg0.conf
+
+# MLAT Data & Logs
+*.jsonl
+*.log
+location-overrides.txt
+data-pipe/mlat-pipe
