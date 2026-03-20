@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +52,28 @@ HOST = os.environ.get("MLAT_MAP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MLAT_MAP_PORT", "8080"))
 UPDATE_INTERVAL_S = float(os.environ.get("MLAT_UPDATE_INTERVAL", "1.0"))
 
-app = FastAPI(title="MLAT Live Map", version="1.0.0")
+PRUNE_INTERVAL_S = 60.0
+MAX_TRACK_AGE_S = 300.0
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Manage background tasks for the application lifecycle."""
+    task = asyncio.create_task(_periodic_prune())
+    yield
+    task.cancel()
+
+
+async def _periodic_prune() -> None:
+    """Prune stale aircraft from the store every PRUNE_INTERVAL_S seconds."""
+    while True:
+        await asyncio.sleep(PRUNE_INTERVAL_S)
+        pruned = store.prune_stale(MAX_TRACK_AGE_S)
+        if pruned > 0:
+            log(f"Pruned {pruned} stale aircraft from store")
+
+
+app = FastAPI(title="MLAT Live Map", version="1.0.0", lifespan=lifespan)
 
 # Mount static files for the frontend
 static_dir = Path(__file__).parent / "static"
