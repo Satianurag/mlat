@@ -4,14 +4,92 @@ Aircraft localization using Time Difference of Arrival (TDOA) from Neuron's 4DSk
 
 Built for the Hedera Hello Future Apex Hackathon.
 
+## Prerequisites
+
+- **Go 1.21+** — to build the data pipe
+- **Python 3.10+** — for decoder, correlator, solver, tracker, and live map
+- **Oracle Cloud VM with WireGuard** — provides a public IP (`161.118.172.83`) with port forwarding so the buyer node is reachable by sellers. The pipeline runs locally and tunnels through WireGuard.
+- **UDP buffer tuning** — the QUIC transport needs large buffers:
+  ```bash
+  sudo sysctl -w net.core.rmem_max=7500000
+  sudo sysctl -w net.core.wmem_max=7500000
+  ```
+
+## Quick Start
+
+### 1. Configure credentials
+
+Place your `buyer-env` file in the project root with the following keys:
+
+```
+eth_rpc_url=https://testnet.hashio.io/api
+hedera_evm_id=<your_evm_id>
+hedera_id=<your_hedera_id>
+location={"lat":28.4675,"lon":77.2840,"alt":0.000000}
+mirror_api_url=https://testnet.mirrornode.hedera.com/api/v1
+private_key=<your_private_key>
+smart_contract_address=<your_contract_address>
+list_of_sellers=<comma_separated_seller_public_keys>
+port=61339
+buyer_or_seller=buyer
+```
+
+Then create symlinks in `data-pipe/`:
+
+```bash
+cd data-pipe
+ln -sf ../buyer-env .buyer-env
+ln -sf ../buyer-env .env
+```
+
+### 2. Set up location overrides
+
+Place `location-overrides.txt` in `data-pipe/`. This is a JSON array of corrected sensor positions (sellers report slightly offset locations for privacy):
+
+```json
+[
+  {"name": "ne073 Penzance", "lat": 50.0992, "lon": -5.5567, "alt": 153.8, "public_key": "..."},
+  ...
+]
+```
+
+The solver matches each `sensor_id` to an override by geographic proximity and replaces lat/lon/alt before solving.
+
+### 3. Build the data pipe
+
+```bash
+cd data-pipe
+go build -o mlat-pipe .
+```
+
+### 4. Run the full pipeline
+
+```bash
+./run-pipeline.sh
+```
+
+This script reads the port from `.buyer-env` and passes all required CLI flags. Output goes to `data-pipe/correlation_groups.jsonl`. Logs go to `data-pipe/pipe.log`, `decoder.log`, and `correlator.log`.
+
+To run the solver on captured data:
+
+```bash
+cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py 2>solver.log > solved.jsonl
+```
+
+### 5. Verify
+
+Check `pipe.log` for `NEW STREAM from seller:` lines — you should see one per connected seller. Check `Active sensor connections:` for the count.
+
+> **Critical SDK Gotcha:** The Neuron SDK's `init()` function parses `pflag` CLI flags and checks `--port` **before** `main()` runs. The env file is loaded later via `godotenv` and only sets OS env vars — pflag never sees them. Therefore `--port`, `--buyer-or-seller`, `--mode`, `--list-of-sellers-source`, and `--envFile` **must** be passed as command-line arguments. The `run-pipeline.sh` script handles this automatically.
+
 ## Architecture
 
 | Layer | Component | Language | Description |
 |-------|-----------|----------|-------------|
 | 1 | Data Pipe | Go | Connects to Neuron 4DSky network, receives raw Mode-S packets |
 | 2 | Mode-S Decoder | Python | Decodes raw bytes using pyModeS: ICAO, altitude, DF type |
-| 3 | Correlation Engine | Python | Groups messages from 3+ sensors by ICAO + time window |
-| 4 | MLAT Solver | Python | Frisch TOA formulation with Inamdar algebraic init |
+| 3 | Correlation Engine | Python | Groups messages from 2+ sensors by ICAO + time window |
+| 4 | MLAT Solver | Python | Frisch TOA formulation with Inamdar algebraic init + location overrides |
 | 5 | Track Builder | Python | EKF for continuous flight track association |
 | 6 | Live Map | React | MapLibre GL JS + Deck.gl real-time visualization |
 
@@ -23,17 +101,30 @@ The Go data pipe connects to the Neuron 4DSky network as a buyer node using the 
 
 ```bash
 cd data-pipe
-go build -o mlat-pipe ./...
+go build -o mlat-pipe .
 ```
 
 ### Run
 
+Use the pipeline script (recommended):
+
 ```bash
-cd data-pipe
-./mlat-pipe --buyer-or-seller buyer --port 12345
+./run-pipeline.sh
 ```
 
-Requires a `.env` file with buyer credentials in the `data-pipe/` directory.
+Or run manually with all required CLI flags:
+
+```bash
+cd data-pipe
+./mlat-pipe \
+    --port 61339 \
+    --buyer-or-seller buyer \
+    --mode peer \
+    --list-of-sellers-source env \
+    --envFile .buyer-env
+```
+
+Requires `.buyer-env` symlink pointing to the `buyer-env` credentials file.
 
 ### Output Format
 
@@ -71,10 +162,10 @@ pip install -r modes-decoder/requirements.txt
 
 ### Run
 
-Pipe Layer 1 output directly into Layer 2:
+The full pipeline runs all layers together via `run-pipeline.sh`. To run just Layer 1 → 2:
 
 ```bash
-cd data-pipe && ./mlat-pipe --buyer-or-seller buyer --port 12345 | python3 ../modes-decoder/main.py
+cd data-pipe && ./mlat-pipe --port 61339 --buyer-or-seller buyer --mode peer --list-of-sellers-source env --envFile .buyer-env | python3 ../modes-decoder/main.py
 ```
 
 Or replay from a saved file:
@@ -131,10 +222,10 @@ Environment variables:
 
 ### Run
 
-Full pipeline (Layer 1 → 2 → 3):
+Full pipeline (Layer 1 → 2 → 3) — use `./run-pipeline.sh` for the recommended approach, or manually:
 
 ```bash
-./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py
+cd data-pipe && ./mlat-pipe --port 61339 --buyer-or-seller buyer --mode peer --list-of-sellers-source env --envFile .buyer-env | python3 ../modes-decoder/main.py | python3 ../correlation-engine/main.py
 ```
 
 Or replay from saved Layer 2 output:
@@ -207,10 +298,10 @@ pip install -r mlat-solver/requirements.txt
 
 ### Run
 
-Full pipeline (Layer 1 → 2 → 3 → 4):
+Full pipeline (Layer 1 → 2 → 3 → 4) — use `./run-pipeline.sh` to capture Layer 3 output, then:
 
 ```bash
-./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py
+cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py 2>solver.log > solved.jsonl
 ```
 
 Or replay from saved Layer 3 output:
@@ -298,7 +389,7 @@ pip install -r track-builder/requirements.txt
 Full pipeline (Layer 1 → 2 → 3 → 4 → 5):
 
 ```bash
-./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py | python3 track-builder/main.py
+cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py | python3 track-builder/main.py
 ```
 
 Or replay from saved Layer 4 output:
@@ -398,7 +489,7 @@ pip install -r live-map/requirements.txt
 Full pipeline (Layer 1 → 2 → 3 → 4 → 5 → 6):
 
 ```bash
-./data-pipe/mlat-pipe | python3 modes-decoder/main.py | python3 correlation-engine/main.py | python3 mlat-solver/main.py | python3 track-builder/main.py | python3 live-map/server.py
+cat data-pipe/correlation_groups.jsonl | python3 mlat-solver/main.py | python3 track-builder/main.py | python3 live-map/server.py
 ```
 
 Or run with synthetic demo data (no pipeline required):

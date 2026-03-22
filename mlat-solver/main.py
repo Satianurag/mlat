@@ -134,6 +134,97 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# =============================================================
+# Location Override System
+# =============================================================
+# The Neuron sellers report slightly-off positions (privacy).
+# The challenge provides location-overrides.txt with corrected
+# lat/lon/alt for each sensor. We match sensor_id → override
+# by geographic proximity and replace positions before solving.
+
+_OVERRIDE_MATCH_THRESHOLD_DEG = 0.5  # ~55km — generous to catch offset sensors
+
+def _load_location_overrides() -> list[dict]:
+    """Load location overrides from the JSON file."""
+    # Try multiple paths
+    for path in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data-pipe", "location-overrides.txt"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "location-override(2).json"),
+    ]:
+        path = os.path.normpath(path)
+        if os.path.exists(path):
+            with open(path) as f:
+                overrides = json.load(f)
+            log(f"Loaded {len(overrides)} location overrides from {path}")
+            return overrides
+    log("WARNING: No location-overrides file found!")
+    return []
+
+
+class SensorOverrideMap:
+    """Maps sensor_id (int64) to corrected positions from location-overrides."""
+
+    def __init__(self, overrides: list[dict]) -> None:
+        self._overrides = overrides
+        self._sensor_map: dict[int, dict] = {}  # sensor_id → override entry
+        self._rejected: set[int] = set()  # sensor_ids confirmed non-Cornwall
+        self.matched_count = 0
+
+    def lookup(self, sensor_id: int, stream_lat: float, stream_lon: float) -> dict | None:
+        """Return the override entry for this sensor_id, or None if non-Cornwall."""
+        if sensor_id in self._sensor_map:
+            return self._sensor_map[sensor_id]
+        if sensor_id in self._rejected:
+            return None
+
+        # Try to match by position proximity
+        best = None
+        best_dist = _OVERRIDE_MATCH_THRESHOLD_DEG
+        for o in self._overrides:
+            dist = ((stream_lat - o["lat"]) ** 2 + (stream_lon - o["lon"]) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best = o
+        if best is not None:
+            self._sensor_map[sensor_id] = best
+            self.matched_count += 1
+            log(f"Matched sensor {sensor_id} → {best['name']} (dist={best_dist:.6f}°)")
+            return best
+        else:
+            self._rejected.add(sensor_id)
+            return None
+
+    def is_cornwall(self, sensor_id: int) -> bool:
+        return sensor_id in self._sensor_map
+
+    def stats_dict(self) -> dict:
+        return {
+            "matched_sensors": self.matched_count,
+            "rejected_sensors": len(self._rejected),
+            "sensor_names": {str(sid): o["name"] for sid, o in self._sensor_map.items()},
+        }
+
+
+def _apply_overrides(receptions: list[dict], override_map: SensorOverrideMap) -> list[dict]:
+    """Apply location overrides to receptions and filter non-Cornwall sensors.
+
+    Returns only receptions from known Cornwall sensors with corrected positions.
+    """
+    corrected = []
+    for rec in receptions:
+        sid = rec.get("sensor_id")
+        if sid is None:
+            continue
+        override = override_map.lookup(sid, rec.get("lat", 0), rec.get("lon", 0))
+        if override is not None:
+            rec = dict(rec)  # shallow copy to avoid mutating original
+            rec["lat"] = override["lat"]
+            rec["lon"] = override["lon"]
+            rec["alt"] = override["alt"]
+            corrected.append(rec)
+    return corrected
+
+
 def _extract_df17_altitude(raw_msg: str) -> int | None:
     """Extract altitude from a DF17 TC 9-18 airborne position message.
 
@@ -161,9 +252,18 @@ def _process_group(
     stats: Stats,
     counters: dict,
     now: float,
+    override_map: SensorOverrideMap | None = None,
 ) -> None:
     """Process a single correlation group through the full pipeline."""
     receptions = group.get("receptions", [])
+
+    # Apply location overrides and filter to Cornwall-only sensors
+    if override_map is not None:
+        receptions = _apply_overrides(receptions, override_map)
+        if receptions:
+            group = dict(group)
+            group["receptions"] = receptions
+
     n_sensors = len(receptions)
     if n_sensors < 2:
         stats.groups_skipped_sensors += 1
@@ -361,6 +461,10 @@ def main() -> None:
     log("=== MLAT Solver (Layer 4) — Enhanced with ADS-B CPR Seeding ===")
     log("Solver: Frisch TOA formulation with Inamdar algebraic initialization")
 
+    # Load location overrides for Cornwall sensors
+    overrides = _load_location_overrides()
+    override_map = SensorOverrideMap(overrides) if overrides else None
+
     stats = Stats()
     clock_cal = ClockCalibrator()
     pos_cache = PositionCache()
@@ -394,7 +498,7 @@ def main() -> None:
 
             _process_group(
                 group, clock_cal, pos_cache, cpr_buffer,
-                stats, counters, _msg_ts,
+                stats, counters, _msg_ts, override_map,
             )
 
     except KeyboardInterrupt:
@@ -409,6 +513,8 @@ def main() -> None:
         final_stats["cpr_cache_seeds"] = counters["cpr_seeds"]
         final_stats["df17_alt_extracted"] = counters["df17_alt_extracted"]
         final_stats["cached_alt_used"] = counters["cached_alt_used"]
+        if override_map is not None:
+            final_stats["location_overrides"] = override_map.stats_dict()
         log("Shutting down. Final stats:")
         log(f"[stats] {json.dumps(final_stats, indent=2)}")
         log(f"Clock calibration: {clock_cal.calibrated_pairs} valid pairings")

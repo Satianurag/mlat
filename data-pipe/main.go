@@ -51,7 +51,10 @@ func main() {
 	log.Println("Starting Neuron SDK buyer node...")
 	log.Println("Mode-S packets will be emitted as JSON on stdout")
 
-	setDefaultFlags()
+	// Inject flags that are only checked in LaunchSDK() (not in init()).
+	// Flags checked in init() (--port, --buyer-or-seller, --envFile) must
+	// be passed on the command line — see run-pipeline.sh.
+	injectCLIFlags()
 
 	go logStats()
 
@@ -218,9 +221,24 @@ func logStats() {
 	}
 }
 
-// setDefaultFlags injects sensible defaults for the Neuron SDK flags
-// so the user doesn't have to pass them on every run.
-func setDefaultFlags() {
+// injectCLIFlags reads the .buyer-env file and injects required CLI flags
+// into os.Args BEFORE the SDK's init() parses them.
+//
+// The Neuron SDK has an init() function (neuron-sdk.go:56) that calls
+// pflag.Parse() and checks PortFlag before our main() runs. The env file
+// only sets OS env vars via godotenv — pflag doesn't read those. So flags
+// like --port, --buyer-or-seller, --mode MUST be in os.Args before init().
+//
+// This function is called from our own init() in _preinit.go, which runs
+// before the SDK's init() because Go processes same-package init() in
+// filename order, but imported packages always run first. So we use a
+// workaround: inject into os.Args in init() of the main package.
+//
+// IMPORTANT: This won't work because imported package init() runs BEFORE
+// main package init(). The actual solution is to pass flags on the command
+// line. This function exists as a fallback for any flags checked in
+// LaunchSDK() (after init), like --list-of-sellers-source.
+func injectCLIFlags() {
 	hasFlag := func(name string) bool {
 		for _, arg := range os.Args[1:] {
 			if strings.Contains(arg, name) {
@@ -230,18 +248,29 @@ func setDefaultFlags() {
 		return false
 	}
 
-	// Default to reading sellers from env file (list_of_sellers in .buyer-env)
-	// instead of querying the Neuron Explorer API.
+	// --list-of-sellers-source is checked in LaunchSDK(), not init(),
+	// so injecting it here (in main()) still works.
 	if !hasFlag("list-of-sellers-source") {
 		os.Args = append(os.Args, "--list-of-sellers-source", "env")
-		log.Println("Defaulting --list-of-sellers-source to 'env'")
 	}
+}
 
-	// Auto-detect .buyer-env if no --envFile was specified and .buyer-env exists.
-	if !hasFlag("envFile") {
-		if _, err := os.Stat(".buyer-env"); err == nil {
-			os.Args = append(os.Args, "--envFile", ".buyer-env")
-			log.Println("Auto-detected .buyer-env file")
+// readEnvFile parses a simple KEY=VALUE env file (no quotes handling needed).
+func readEnvFile(path string) map[string]string {
+	result := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return result
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
 	}
+	return result
 }
